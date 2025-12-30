@@ -1,129 +1,286 @@
-name: RDP
+name: 64GB RDP Fast Test Mode
 
 on:
   workflow_dispatch:
+    inputs:
+      test_mode:
+        description: 'Test mode (no persistence)'
+        required: true
+        default: 'yes'
+        type: choice
+        options:
+        - 'yes'
+        - 'no'
+      duration:
+        description: 'RDP session duration in minutes'
+        required: false
+        default: '120'
+        type: string
 
 jobs:
-  secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
+  setup-64gb-rdp:
+    # IMPORTANT: This requires a self-hosted Windows runner with 64GB RAM
+    runs-on: [self-hosted, windows, x64, 64gb]
+    timeout-minutes: 240
     
-    # Add resource class for 64GB RAM (GitHub-hosted runner specification)
-    # Note: GitHub-hosted runners have fixed specs. For custom hardware, you'd need self-hosted runners.
-    # For 64GB RAM, you'll need to use a self-hosted runner with appropriate hardware.
-    
-    # If using GitHub-hosted runners, windows-latest provides 7GB RAM.
-    # For 64GB RAM, you MUST use self-hosted runners.
-    
-    # Uncomment and modify for self-hosted runner with 64GB RAM:
-    # runs-on: [self-hosted, windows, x64, 64GB]
-
     steps:
-      - name: Check System Resources
+      - name: Validate Hardware Resources
         run: |
-          # Display current system resources
-          systeminfo | findstr /C:"Total Physical Memory" /C:"Available Physical Memory"
-          Write-Host "For 64GB RAM, ensure you're using a self-hosted runner with appropriate hardware"
-
-      - name: Configure Core RDP Settings
-        run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          Write-Host "=== SYSTEM VALIDATION ==="
+          $mem = Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object TotalPhysicalMemory
+          $ramGB = [math]::Round($mem.TotalPhysicalMemory / 1GB, 2)
+          Write-Host "Total RAM: $ramGB GB"
           
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
-        run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126)) # Special characters
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
+          if ($ramGB -lt 60) {
+              Write-Error "❌ INSUFFICIENT RAM: Need 64GB, found $ramGB GB"
               exit 1
           }
+          
+          $cpu = Get-CimInstance -ClassName Win32_Processor
+          Write-Host "CPU: $($cpu.Name)"
+          Write-Host "Cores: $($cpu.NumberOfCores)"
+          Write-Host "Threads: $($cpu.NumberOfLogicalProcessors)"
+          
+          $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'"
+          $freeGB = [math]::Round($disk.FreeSpace / 1GB, 2)
+          Write-Host "C: Drive Free Space: $freeGB GB"
+          
+          Write-Host "✅ System validated for 64GB RDP"
+        shell: pwsh
 
-      - name: Install Tailscale
+      - name: Fast RDP Configuration (Test Mode)
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
+          Write-Host "⚡ FAST RDP CONFIGURATION STARTING..."
           
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          # Disable Windows Defender for better performance (TEST MODE ONLY)
+          if ("${{ github.event.inputs.test_mode }}" -eq 'yes') {
+              Set-MpPreference -DisableRealtimeMonitoring $true
+              Set-MpPreference -DisableBehaviorMonitoring $true
+              Set-MpPreference -DisableBlockAtFirstSeen $true
+              Write-Host "🛡️ Windows Defender disabled (test mode)"
+          }
+          
+          # Optimize network performance
+          Set-NetTCPSetting -SettingName InternetCustom -AutoTuningLevelLocal Experimental
+          Set-NetTCPSetting -SettingName DatacenterCustom -AutoTuningLevelLocal Experimental
+          
+          # Enable RDP with minimal security for test mode
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          
+          if ("${{ github.event.inputs.test_mode }}" -eq 'yes') {
+              # Test mode: Disable NLA and security layer for faster connection
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxMonitors" -Value 4 -Force
+              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxResolution" -Value 4 -Force
+              Write-Host "🔓 Test mode: NLA disabled"
+          }
+          
+          # Configure firewall
+          netsh advfirewall firewall delete rule name="RDP-64GB" 2>$null
+          netsh advfirewall firewall add rule name="RDP-64GB" dir=in action=allow protocol=TCP localport=3389
+          
+          # Restart service
+          Restart-Service TermService -Force
+          Write-Host "✅ RDP configured for fast connections"
+        shell: pwsh
 
-      - name: Establish Tailscale Connection
+      - name: Create High-Performance Test User
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # Generate simple password for test mode
+          $simplePassword = "TestRDP64GB@123"
           
-          # Wait for Tailscale to assign an IP
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          if ("${{ github.event.inputs.test_mode }}" -eq 'no') {
+              # For non-test mode, generate secure password
+              Add-Type -AssemblyName System.Web
+              $simplePassword = [System.Web.Security.Membership]::GeneratePassword(16, 4)
           }
           
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          # Create user
+          $securePass = ConvertTo-SecureString $simplePassword -AsPlainText -Force
           
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
+          # Check if user exists
+          $userExists = Get-LocalUser -Name "TestUser64GB" -ErrorAction SilentlyContinue
+          if ($userExists) {
+              Set-LocalUser -Name "TestUser64GB" -Password $securePass
+              Write-Host "🔄 User password updated"
+          } else {
+              New-LocalUser -Name "TestUser64GB" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+              Write-Host "👤 New user created"
           }
-          Write-Host "TCP connectivity successful!"
+          
+          # Add to groups
+          Add-LocalGroupMember -Group "Administrators" -Member "TestUser64GB" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TestUser64GB" -ErrorAction SilentlyContinue
+          
+          # Set password never expires
+          Set-LocalUser -Name "TestUser64GB" -PasswordNeverExpires $true
+          
+          # Store credentials
+          echo "RDP_USER=TestUser64GB" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$simplePassword" >> $env:GITHUB_ENV
+          
+          Write-Host "✅ User configured: TestUser64GB"
+        shell: pwsh
 
-      - name: Maintain Connection
+      - name: Optimize System Performance
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          Write-Host "🚀 OPTIMIZING SYSTEM PERFORMANCE..."
           
-          # Keep runner active indefinitely (or until manually cancelled)
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+          # Set power plan to high performance
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          
+          # Disable visual effects for better RDP performance
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Name "VisualFXSetting" -Value 2
+          
+          # Optimize for background services
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" -Name "Win32PrioritySeparation" -Value 38
+          
+          # Disable Windows animations
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "UserPreferencesMask" -Value ([byte[]](144,18,3,128,16,0,0,0))
+          
+          Write-Host "✅ System optimized for performance"
+        shell: pwsh
+
+      - name: Get Network Information
+        run: |
+          Write-Host "🌐 NETWORK INFORMATION"
+          
+          # Get public IP
+          $publicIP = (Invoke-RestMethod -Uri "https://api.ipify.org").Trim()
+          echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
+          
+          # Get local IP
+          $localIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.InterfaceAlias -like "*Ethernet*" -or $_.InterfaceAlias -like "*Wi-Fi*"} | Select-Object -First 1).IPAddress
+          echo "LOCAL_IP=$localIP" >> $env:GITHUB_ENV
+          
+          Write-Host "Public IP: $publicIP"
+          Write-Host "Local IP: $localIP"
+          
+          # Test RDP port
+          $portTest = Test-NetConnection -ComputerName $localIP -Port 3389 -WarningAction SilentlyContinue
+          if ($portTest.TcpTestSucceeded) {
+              Write-Host "✅ RDP Port 3389 is open and accessible"
+          } else {
+              Write-Host "⚠️ RDP Port test failed locally"
           }
+        shell: pwsh
+
+      - name: Install Performance Monitoring Tools (Optional)
+        if: ${{ github.event.inputs.test_mode == 'yes' }}
+        run: |
+          Write-Host "📊 INSTALLING TEST TOOLS..."
+          
+          # Install Chocolatey (if not present)
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+              Set-ExecutionPolicy Bypass -Scope Process -Force
+              [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+              iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
+          }
+          
+          # Install useful tools for testing
+          choco install sysinternals -y --no-progress
+          choco install cpu-z -y --no-progress
+          choco install hwinfo -y --no-progress
+          choco install 7zip -y --no-progress
+          
+          Write-Host "✅ Test tools installed"
+        shell: pwsh
+
+      - name: Display RDP Access Information
+        run: |
+          Write-Host ""
+          Write-Host "══════════════════════════════════════════════════════════════"
+          Write-Host "                     🚀 64GB RDP READY! 🚀"
+          Write-Host "══════════════════════════════════════════════════════════════"
+          Write-Host ""
+          Write-Host "📌 CONNECTION DETAILS:"
+          Write-Host "   Public IP: $env:PUBLIC_IP"
+          Write-Host "   Local IP:  $env:LOCAL_IP"
+          Write-Host "   Port:      3389"
+          Write-Host ""
+          Write-Host "👤 CREDENTIALS:"
+          Write-Host "   Username:  $env:RDP_USER"
+          Write-Host "   Password:  $env:RDP_PASSWORD"
+          Write-Host ""
+          Write-Host "🔧 SYSTEM SPECS:"
+          $mem = Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object TotalPhysicalMemory
+          $ramGB = [math]::Round($mem.TotalPhysicalMemory / 1GB, 2)
+          Write-Host "   RAM:       $ramGB GB"
+          $cpu = Get-CimInstance -ClassName Win32_Processor
+          Write-Host "   CPU:       $($cpu.Name)"
+          Write-Host ""
+          Write-Host "⏰ SESSION DURATION: ${{ github.event.inputs.duration }} minutes"
+          Write-Host "🔓 MODE: ${{ github.event.inputs.test_mode == 'yes' && 'TEST MODE (NLA Disabled)' || 'SECURE MODE' }}"
+          Write-Host ""
+          Write-Host "💡 TIPS:"
+          Write-Host "   1. Use mstsc.exe to connect"
+          Write-Host "   2. For test mode, uncheck 'Always ask for credentials'"
+          Write-Host "   3. Set display to 1920x1080 for best performance"
+          Write-Host ""
+          Write-Host "⚠️  WARNING: This session will auto-terminate after ${{ github.event.inputs.duration }} minutes"
+          Write-Host "══════════════════════════════════════════════════════════════"
+          Write-Host ""
+          
+          # Save info to file
+          $info = @"
+64GB RDP ACCESS INFORMATION
+===========================
+Timestamp: $(Get-Date)
+Connection:
+  - Public IP: $env:PUBLIC_IP
+  - Local IP:  $env:LOCAL_IP
+  - Port:      3389
+
+Credentials:
+  - Username: $env:RDP_USER
+  - Password: $env:RDP_PASSWORD
+
+System:
+  - RAM: $ramGB GB
+  - CPU: $($cpu.Name)
+  - Mode: ${{ github.event.inputs.test_mode == 'yes' && 'TEST' || 'SECURE' }}
+  
+Connection String:
+  mstsc /v:$env:PUBLIC_IP
+"@
+          
+          $info | Out-File -FilePath "$env:GITHUB_WORKSPACE\RDP_Access_Info.txt"
+          Write-Host "📄 Access info saved to RDP_Access_Info.txt"
+        shell: pwsh
+
+      - name: Active Session Timer
+        run: |
+          $duration = ${{ github.event.inputs.duration }}
+          $endTime = (Get-Date).AddMinutes($duration)
+          
+          Write-Host "⏰ Session started at: $(Get-Date)"
+          Write-Host "⏰ Session will end at: $endTime"
+          Write-Host ""
+          
+          # Countdown timer
+          while ((Get-Date) -lt $endTime) {
+              $remaining = [math]::Round(($endTime - (Get-Date)).TotalMinutes, 1)
+              Write-Host "[$(Get-Date)] RDP Active - $remaining minutes remaining"
+              
+              # Every 5 minutes, show system status
+              if ([math]::Round($remaining) % 5 -eq 0) {
+                  $cpuLoad = (Get-Counter '\Processor(_Total)\% Processor Time').CounterSamples.CookedValue
+                  $ramUsage = (Get-CimInstance Win32_OperatingSystem)
+                  $usedRAM = [math]::Round(($ramUsage.TotalVisibleMemorySize - $ramUsage.FreePhysicalMemory) / 1MB, 2)
+                  Write-Host "   📊 Status: CPU: $cpuLoad% | RAM: ${usedRAM}GB/$ramGB GB used"
+              }
+              
+              Start-Sleep -Seconds 60
+          }
+          
+          Write-Host "⏰ Session time expired! Shutting down RDP..."
+          
+          # Cleanup (test mode only)
+          if ("${{ github.event.inputs.test_mode }}" -eq 'yes') {
+              Write-Host "🧹 Cleaning up test user..."
+              Remove-LocalUser -Name "TestUser64GB" -ErrorAction SilentlyContinue
+          }
+          
+          Write-Host "✅ Session ended"
+        shell: pwsh
