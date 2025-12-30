@@ -1,108 +1,86 @@
-name: 64GB RDP Fast Test Mode
+name: RDP Self-Hosted Stable
 
 on:
   workflow_dispatch:
     inputs:
-      test_mode:
-        description: 'Test mode (no persistence)'
-        required: true
-        default: 'yes'
-        type: choice
-        options:
-        - 'yes'
-        - 'no'
       duration:
-        description: 'RDP session duration in minutes'
-        required: false
+        description: 'RDP session duration (minutes)'
+        required: true
         default: '120'
-        type: string
 
 jobs:
-  setup-64gb-rdp:
-    # IMPORTANT: This requires a self-hosted Windows runner with 64GB RAM
-    runs-on: [self-hosted, windows, x64, 64gb]
-    timeout-minutes: 240
-    
+  rdp:
+    runs-on: [self-hosted, windows, x64]
+    timeout-minutes: 300
+
     steps:
-      - name: Validate Hardware Resources
+      - name: System Info
+        shell: pwsh
         run: |
-          Write-Host "=== SYSTEM VALIDATION ==="
-          $mem = Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object TotalPhysicalMemory
-          $ramGB = [math]::Round($mem.TotalPhysicalMemory / 1GB, 2)
-          Write-Host "Total RAM: $ramGB GB"
-          
-          if ($ramGB -lt 60) {
-              Write-Error "❌ INSUFFICIENT RAM: Need 64GB, found $ramGB GB"
-              exit 1
-          }
-          
-          $cpu = Get-CimInstance -ClassName Win32_Processor
+          Write-Host "=== SYSTEM INFO ==="
+          $ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
+          Write-Host "RAM: $([math]::Round($ram,2)) GB"
+          $cpu = Get-CimInstance Win32_Processor
           Write-Host "CPU: $($cpu.Name)"
-          Write-Host "Cores: $($cpu.NumberOfCores)"
-          Write-Host "Threads: $($cpu.NumberOfLogicalProcessors)"
-          
-          $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='C:'"
-          $freeGB = [math]::Round($disk.FreeSpace / 1GB, 2)
-          Write-Host "C: Drive Free Space: $freeGB GB"
-          
-          Write-Host "✅ System validated for 64GB RDP"
-        shell: pwsh
 
-      - name: Fast RDP Configuration (Test Mode)
+      - name: Enable RDP
+        shell: pwsh
         run: |
-          Write-Host "⚡ FAST RDP CONFIGURATION STARTING..."
-          
-          # Disable Windows Defender for better performance (TEST MODE ONLY)
-          if ("${{ github.event.inputs.test_mode }}" -eq 'yes') {
-              Set-MpPreference -DisableRealtimeMonitoring $true
-              Set-MpPreference -DisableBehaviorMonitoring $true
-              Set-MpPreference -DisableBlockAtFirstSeen $true
-              Write-Host "🛡️ Windows Defender disabled (test mode)"
-          }
-          
-          # Optimize network performance
-          Set-NetTCPSetting -SettingName InternetCustom -AutoTuningLevelLocal Experimental
-          Set-NetTCPSetting -SettingName DatacenterCustom -AutoTuningLevelLocal Experimental
-          
-          # Enable RDP with minimal security for test mode
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          
-          if ("${{ github.event.inputs.test_mode }}" -eq 'yes') {
-              # Test mode: Disable NLA and security layer for faster connection
-              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxMonitors" -Value 4 -Force
-              Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxResolution" -Value 4 -Force
-              Write-Host "🔓 Test mode: NLA disabled"
-          }
-          
-          # Configure firewall
-          netsh advfirewall firewall delete rule name="RDP-64GB" 2>$null
-          netsh advfirewall firewall add rule name="RDP-64GB" dir=in action=allow protocol=TCP localport=3389
-          
-          # Restart service
+          Write-Host "Enabling RDP..."
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Restart-Service TermService -Force
-          Write-Host "✅ RDP configured for fast connections"
-        shell: pwsh
+          Write-Host "RDP Enabled"
 
-      - name: Create High-Performance Test User
+      - name: Create RDP User
+        shell: pwsh
         run: |
-          # Generate simple password for test mode
-          $simplePassword = "TestRDP64GB@123"
-          
-          if ("${{ github.event.inputs.test_mode }}" -eq 'no') {
-              # For non-test mode, generate secure password
-              Add-Type -AssemblyName System.Web
-              $simplePassword = [System.Web.Security.Membership]::GeneratePassword(16, 4)
+          $user = "rdpuser"
+          $pass = "Rdp@123456"
+
+          $secure = ConvertTo-SecureString $pass -AsPlainText -Force
+          if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $user -Password $secure
+          } else {
+            New-LocalUser -Name $user -Password $secure -PasswordNeverExpires
           }
-          
-          # Create user
-          $securePass = ConvertTo-SecureString $simplePassword -AsPlainText -Force
-          
-          # Check if user exists
-          $userExists = Get-LocalUser -Name "TestUser64GB" -ErrorAction SilentlyContinue
-          if ($userExists) {
-              Set-LocalUser -Name "TestUser64GB" -Password $securePass
+
+          Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
+
+          echo "RDP_USER=$user" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$pass" >> $env:GITHUB_ENV
+
+      - name: Show Connection Info
+        shell: pwsh
+        run: |
+          try {
+            $ip = Invoke-RestMethod https://api.ipify.org
+          } catch {
+            $ip = "CHECK ROUTER IP"
+          }
+
+          Write-Host "=============================="
+          Write-Host "RDP READY"
+          Write-Host "IP: $ip"
+          Write-Host "PORT: 3389"
+          Write-Host "USER: $env:RDP_USER"
+          Write-Host "PASS: $env:RDP_PASS"
+          Write-Host "=============================="
+
+      - name: Keep Session Alive
+        shell: pwsh
+        run: |
+          $mins = [int]"${{ github.event.inputs.duration }}"
+          $end = (Get-Date).AddMinutes($mins)
+
+          while ((Get-Date) -lt $end) {
+            Write-Host "RDP ACTIVE - Remaining: $([math]::Round(($end-(Get-Date)).TotalMinutes)) min"
+            Start-Sleep 60
+          }
+
+          Write-Host "Session ended"              Set-LocalUser -Name "TestUser64GB" -Password $securePass
               Write-Host "🔄 User password updated"
           } else {
               New-LocalUser -Name "TestUser64GB" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
