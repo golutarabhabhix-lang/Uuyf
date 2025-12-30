@@ -1,264 +1,264 @@
-name: RDP Self-Hosted Stable
+name: 🚀 RDP-64GB Test Mode
 
 on:
   workflow_dispatch:
     inputs:
       duration:
-        description: 'RDP session duration (minutes)'
+        description: 'RDP Duration (minutes)'
         required: true
         default: '120'
+        type: choice
+        options:
+          - '60'
+          - '120'
+          - '240'
+          - '480'
+      region:
+        description: 'Azure Region'
+        required: false
+        default: 'eastus'
+        type: string
 
 jobs:
-  rdp:
-    runs-on: [self-hosted, windows, x64]
-    timeout-minutes: 300
-
+  deploy-64gb-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    outputs:
+      vm-ip: ${{ steps.get-vm-ip.outputs.vm-ip }}
+      vm-name: ${{ steps.create-vm.outputs.vm-name }}
+    
     steps:
-      - name: System Info
-        shell: pwsh
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          
+      - name: Deploy 64GB Azure VM (Standard_D16s_v5)
+        id: create-vm
         run: |
-          Write-Host "=== SYSTEM INFO ==="
-          $ram = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
-          Write-Host "RAM: $([math]::Round($ram,2)) GB"
-          $cpu = Get-CimInstance Win32_Processor
-          Write-Host "CPU: $($cpu.Name)"
+          VM_NAME="rdp-64gb-test-$(date +%s)"
+          echo "vm-name=$VM_NAME" >> $GITHUB_OUTPUT
+          
+          az vm create \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name $VM_NAME \
+            --image MicrosoftWindowsServer:WindowsServer:2022-datacenter-g2:latest \
+            --size Standard_D16s_v5 \
+            --admin-username githubuser \
+            --admin-password $(openssl rand -base64 16) \
+            --public-ip-sku Standard \
+            --nic-delete-option Delete \
+            --os-disk-delete-option Delete \
+            --data-disk-sizes-gb 256 \
+            --nsg "" \
+            --custom-data ./cloud-init.ps1 \
+            --location ${{ github.event.inputs.region }} \
+            --output json \
+            --verbose
+          
+          echo "✅ 64GB VM created: $VM_NAME"
 
-      - name: Enable RDP
-        shell: pwsh
+      - name: Open RDP Port (3389)
         run: |
-          Write-Host "Enabling RDP..."
-          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name fDenyTSConnections -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Restart-Service TermService -Force
-          Write-Host "RDP Enabled"
+          az vm open-port \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ steps.create-vm.outputs.vm-name }} \
+            --port 3389 \
+            --priority 100
 
-      - name: Create RDP User
-        shell: pwsh
+      - name: Get VM Public IP
+        id: get-vm-ip
         run: |
-          $user = "rdpuser"
-          $pass = "Rdp@123456"
+          PUBLIC_IP=$(az vm show \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --name ${{ steps.create-vm.outputs.vm-name }} \
+            --show-details \
+            --query 'publicIps' -o tsv)
+          
+          echo "vm-ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+          echo "🌐 Public IP: $PUBLIC_IP"
 
-          $secure = ConvertTo-SecureString $pass -AsPlainText -Force
-          if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
-            Set-LocalUser -Name $user -Password $secure
-          } else {
-            New-LocalUser -Name $user -Password $secure -PasswordNeverExpires
-          }
+  configure-rdp:
+    needs: deploy-64gb-vm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    
+    steps:
+      - name: Install WinRM Support
+        uses: dawidd6/action-setup-winrm@v1
+        with:
+          host: ${{ needs.deploy-64gb-vm.outputs.vm-ip }}
+          username: githubuser
+          password: ${{ secrets.AZURE_VM_PASSWORD }}
 
-          Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user -ErrorAction SilentlyContinue
+      - name: Configure RDP via WinRM
+        uses: appleboy/windows-ssh-action@v0.0.2
+        with:
+          host: ${{ needs.deploy-64gb-vm.outputs.vm-ip }}
+          username: githubuser
+          password: ${{ secrets.AZURE_VM_PASSWORD }}
+          script: |
+            # Enable RDP
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+            
+            # Configure Firewall
+            New-NetFirewallRule -DisplayName "RDP-3389-Test" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Enabled True
+            
+            # Create Test User
+            $password = ConvertTo-SecureString "TestRDP@123" -AsPlainText -Force
+            New-LocalUser -Name "TestUser" -Password $password -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member "TestUser"
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TestUser"
+            
+            # Set High Performance Power Plan
+            powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+            
+            # Restart RDP Service
+            Restart-Service TermService -Force
+            
+            echo "✅ RDP Configured Successfully"
 
-          echo "RDP_USER=$user" >> $env:GITHUB_ENV
-          echo "RDP_PASS=$pass" >> $env:GITHUB_ENV
+      - name: Install Tailscale via WinRM
+        uses: appleboy/windows-ssh-action@v0.0.2
+        with:
+          host: ${{ needs.deploy-64gb-vm.outputs.vm-ip }}
+          username: githubuser
+          password: ${{ secrets.AZURE_VM_PASSWORD }}
+          script: |
+            # Download and Install Tailscale
+            $tailscaleUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+            $installerPath = "$env:TEMP\tailscale.msi"
+            
+            Invoke-WebRequest -Uri $tailscaleUrl -OutFile $installerPath
+            Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+            Remove-Item $installerPath -Force
+            
+            # Start Tailscale
+            Start-Process -FilePath "$env:ProgramFiles\Tailscale\tailscale.exe" -ArgumentList "up", "--authkey=${{ secrets.TAILSCALE_AUTH_KEY }}", "--hostname=azure-64gb-test" -NoNewWindow -Wait
+            
+            # Get Tailscale IP
+            $tailscaleIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            echo "TAILSCALE_IP=$tailscaleIP"
+            
+            # Test Connectivity
+            Test-NetConnection -ComputerName $tailscaleIP -Port 3389
+            echo "✅ Tailscale Installed and Configured"
 
-      - name: Show Connection Info
-        shell: pwsh
+  performance-test:
+    needs: configure-rdp
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    
+    steps:
+      - name: Run Performance Tests
+        uses: appleboy/windows-ssh-action@v0.0.2
+        with:
+          host: ${{ needs.deploy-64gb-vm.outputs.vm-ip }}
+          username: githubuser
+          password: ${{ secrets.AZURE_VM_PASSWORD }}
+          script: |
+            # System Information
+            systeminfo | findstr /C:"Total Physical Memory" /C:"Available Physical Memory" /C:"Processor(s)"
+            
+            # Performance Test
+            Write-Host "🧪 Running Performance Tests..."
+            
+            # Memory Speed Test
+            $memTest = Measure-Command {
+                1..5 | ForEach-Object {
+                    $array = New-Object byte[] 1GB
+                    $array = $null
+                    [GC]::Collect()
+                }
+            }
+            Write-Host "Memory Test Time: $($memTest.TotalSeconds) seconds"
+            
+            # Disk Speed Test
+            Write-Host "Testing Disk Speed..."
+            $diskTest = "$env:TEMP\disktest.dat"
+            $diskResult = Measure-Command {
+                fsutil file createnew $diskTest 1073741824 | Out-Null
+            }
+            Remove-Item $diskTest -Force
+            Write-Host "Disk Write Speed: $([math]::Round(1024/$diskResult.TotalSeconds, 2)) MB/s"
+            
+            # CPU Test
+            Write-Host "Testing CPU..."
+            $cpuTest = Measure-Command {
+                $sum = 0
+                for ($i = 0; $i -lt 10000000; $i++) {
+                    $sum += [math]::Sqrt($i)
+                }
+            }
+            Write-Host "CPU Calculation Time: $($cpuTest.TotalMilliseconds) ms"
+            
+            echo "✅ Performance Tests Complete"
+
+  rdp-access:
+    needs: [deploy-64gb-vm, configure-rdp, performance-test]
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event.inputs.duration }}
+    
+    steps:
+      - name: Display RDP Connection Details
         run: |
-          try {
-            $ip = Invoke-RestMethod https://api.ipify.org
-          } catch {
-            $ip = "CHECK ROUTER IP"
-          }
+          echo "=========================================="
+          echo "🚀 64GB RDP READY FOR TESTING"
+          echo "=========================================="
+          echo "Public IP: ${{ needs.deploy-64gb-vm.outputs.vm-ip }}"
+          echo "Username: TestUser"
+          echo "Password: TestRDP@123"
+          echo "Duration: ${{ github.event.inputs.duration }} minutes"
+          echo ""
+          echo "🔧 System Specs:"
+          echo "   - 64GB RAM"
+          echo "   - 16 vCPUs"
+          echo "   - 256GB SSD"
+          echo "   - Tailscale VPN Installed"
+          echo ""
+          echo "📌 To connect via RDP:"
+          echo "   mstsc /v:${{ needs.deploy-64gb-vm.outputs.vm-ip }}"
+          echo ""
+          echo "⏰ VM will auto-terminate after ${{ github.event.inputs.duration }} minutes"
+          echo "=========================================="
+          
+          # Start countdown
+          MINUTES=${{ github.event.inputs.duration }}
+          SECONDS=$((MINUTES * 60))
+          while [ $SECONDS -gt 0 ]; do
+            MINS=$((SECONDS / 60))
+            SECS=$((SECONDS % 60))
+            printf "\r⏰ RDP Active: %02d:%02d remaining | CTRL+C to stop workflow early " $MINS $SECS
+            sleep 1
+            SECONDS=$((SECONDS - 1))
+          done
 
-          Write-Host "=============================="
-          Write-Host "RDP READY"
-          Write-Host "IP: $ip"
-          Write-Host "PORT: 3389"
-          Write-Host "USER: $env:RDP_USER"
-          Write-Host "PASS: $env:RDP_PASS"
-          Write-Host "=============================="
-
-      - name: Keep Session Alive
-        shell: pwsh
+  cleanup:
+    needs: rdp-access
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          
+      - name: Delete VM and Resources
         run: |
-          $mins = [int]"${{ github.event.inputs.duration }}"
-          $end = (Get-Date).AddMinutes($mins)
-
-          while ((Get-Date) -lt $end) {
-            Write-Host "RDP ACTIVE - Remaining: $([math]::Round(($end-(Get-Date)).TotalMinutes)) min"
-            Start-Sleep 60
-          }
-
-          Write-Host "Session ended"              Set-LocalUser -Name "TestUser64GB" -Password $securePass
-              Write-Host "🔄 User password updated"
-          } else {
-              New-LocalUser -Name "TestUser64GB" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
-              Write-Host "👤 New user created"
-          }
-          
-          # Add to groups
-          Add-LocalGroupMember -Group "Administrators" -Member "TestUser64GB" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TestUser64GB" -ErrorAction SilentlyContinue
-          
-          # Set password never expires
-          Set-LocalUser -Name "TestUser64GB" -PasswordNeverExpires $true
-          
-          # Store credentials
-          echo "RDP_USER=TestUser64GB" >> $env:GITHUB_ENV
-          echo "RDP_PASSWORD=$simplePassword" >> $env:GITHUB_ENV
-          
-          Write-Host "✅ User configured: TestUser64GB"
-        shell: pwsh
-
-      - name: Optimize System Performance
-        run: |
-          Write-Host "🚀 OPTIMIZING SYSTEM PERFORMANCE..."
-          
-          # Set power plan to high performance
-          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
-          
-          # Disable visual effects for better RDP performance
-          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Name "VisualFXSetting" -Value 2
-          
-          # Optimize for background services
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl" -Name "Win32PrioritySeparation" -Value 38
-          
-          # Disable Windows animations
-          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "UserPreferencesMask" -Value ([byte[]](144,18,3,128,16,0,0,0))
-          
-          Write-Host "✅ System optimized for performance"
-        shell: pwsh
-
-      - name: Get Network Information
-        run: |
-          Write-Host "🌐 NETWORK INFORMATION"
-          
-          # Get public IP
-          $publicIP = (Invoke-RestMethod -Uri "https://api.ipify.org").Trim()
-          echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
-          
-          # Get local IP
-          $localIP = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.InterfaceAlias -like "*Ethernet*" -or $_.InterfaceAlias -like "*Wi-Fi*"} | Select-Object -First 1).IPAddress
-          echo "LOCAL_IP=$localIP" >> $env:GITHUB_ENV
-          
-          Write-Host "Public IP: $publicIP"
-          Write-Host "Local IP: $localIP"
-          
-          # Test RDP port
-          $portTest = Test-NetConnection -ComputerName $localIP -Port 3389 -WarningAction SilentlyContinue
-          if ($portTest.TcpTestSucceeded) {
-              Write-Host "✅ RDP Port 3389 is open and accessible"
-          } else {
-              Write-Host "⚠️ RDP Port test failed locally"
-          }
-        shell: pwsh
-
-      - name: Install Performance Monitoring Tools (Optional)
-        if: ${{ github.event.inputs.test_mode == 'yes' }}
-        run: |
-          Write-Host "📊 INSTALLING TEST TOOLS..."
-          
-          # Install Chocolatey (if not present)
-          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-              Set-ExecutionPolicy Bypass -Scope Process -Force
-              [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
-              iex ((New-Object System.Net.WebClient).DownloadString('https://chocolatey.org/install.ps1'))
-          }
-          
-          # Install useful tools for testing
-          choco install sysinternals -y --no-progress
-          choco install cpu-z -y --no-progress
-          choco install hwinfo -y --no-progress
-          choco install 7zip -y --no-progress
-          
-          Write-Host "✅ Test tools installed"
-        shell: pwsh
-
-      - name: Display RDP Access Information
-        run: |
-          Write-Host ""
-          Write-Host "══════════════════════════════════════════════════════════════"
-          Write-Host "                     🚀 64GB RDP READY! 🚀"
-          Write-Host "══════════════════════════════════════════════════════════════"
-          Write-Host ""
-          Write-Host "📌 CONNECTION DETAILS:"
-          Write-Host "   Public IP: $env:PUBLIC_IP"
-          Write-Host "   Local IP:  $env:LOCAL_IP"
-          Write-Host "   Port:      3389"
-          Write-Host ""
-          Write-Host "👤 CREDENTIALS:"
-          Write-Host "   Username:  $env:RDP_USER"
-          Write-Host "   Password:  $env:RDP_PASSWORD"
-          Write-Host ""
-          Write-Host "🔧 SYSTEM SPECS:"
-          $mem = Get-CimInstance -ClassName Win32_ComputerSystem | Select-Object TotalPhysicalMemory
-          $ramGB = [math]::Round($mem.TotalPhysicalMemory / 1GB, 2)
-          Write-Host "   RAM:       $ramGB GB"
-          $cpu = Get-CimInstance -ClassName Win32_Processor
-          Write-Host "   CPU:       $($cpu.Name)"
-          Write-Host ""
-          Write-Host "⏰ SESSION DURATION: ${{ github.event.inputs.duration }} minutes"
-          Write-Host "🔓 MODE: ${{ github.event.inputs.test_mode == 'yes' && 'TEST MODE (NLA Disabled)' || 'SECURE MODE' }}"
-          Write-Host ""
-          Write-Host "💡 TIPS:"
-          Write-Host "   1. Use mstsc.exe to connect"
-          Write-Host "   2. For test mode, uncheck 'Always ask for credentials'"
-          Write-Host "   3. Set display to 1920x1080 for best performance"
-          Write-Host ""
-          Write-Host "⚠️  WARNING: This session will auto-terminate after ${{ github.event.inputs.duration }} minutes"
-          Write-Host "══════════════════════════════════════════════════════════════"
-          Write-Host ""
-          
-          # Save info to file
-          $info = @"
-64GB RDP ACCESS INFORMATION
-===========================
-Timestamp: $(Get-Date)
-Connection:
-  - Public IP: $env:PUBLIC_IP
-  - Local IP:  $env:LOCAL_IP
-  - Port:      3389
-
-Credentials:
-  - Username: $env:RDP_USER
-  - Password: $env:RDP_PASSWORD
-
-System:
-  - RAM: $ramGB GB
-  - CPU: $($cpu.Name)
-  - Mode: ${{ github.event.inputs.test_mode == 'yes' && 'TEST' || 'SECURE' }}
-  
-Connection String:
-  mstsc /v:$env:PUBLIC_IP
-"@
-          
-          $info | Out-File -FilePath "$env:GITHUB_WORKSPACE\RDP_Access_Info.txt"
-          Write-Host "📄 Access info saved to RDP_Access_Info.txt"
-        shell: pwsh
-
-      - name: Active Session Timer
-        run: |
-          $duration = ${{ github.event.inputs.duration }}
-          $endTime = (Get-Date).AddMinutes($duration)
-          
-          Write-Host "⏰ Session started at: $(Get-Date)"
-          Write-Host "⏰ Session will end at: $endTime"
-          Write-Host ""
-          
-          # Countdown timer
-          while ((Get-Date) -lt $endTime) {
-              $remaining = [math]::Round(($endTime - (Get-Date)).TotalMinutes, 1)
-              Write-Host "[$(Get-Date)] RDP Active - $remaining minutes remaining"
-              
-              # Every 5 minutes, show system status
-              if ([math]::Round($remaining) % 5 -eq 0) {
-                  $cpuLoad = (Get-Counter '\Processor(_Total)\% Processor Time').CounterSamples.CookedValue
-                  $ramUsage = (Get-CimInstance Win32_OperatingSystem)
-                  $usedRAM = [math]::Round(($ramUsage.TotalVisibleMemorySize - $ramUsage.FreePhysicalMemory) / 1MB, 2)
-                  Write-Host "   📊 Status: CPU: $cpuLoad% | RAM: ${usedRAM}GB/$ramGB GB used"
-              }
-              
-              Start-Sleep -Seconds 60
-          }
-          
-          Write-Host "⏰ Session time expired! Shutting down RDP..."
-          
-          # Cleanup (test mode only)
-          if ("${{ github.event.inputs.test_mode }}" -eq 'yes') {
-              Write-Host "🧹 Cleaning up test user..."
-              Remove-LocalUser -Name "TestUser64GB" -ErrorAction SilentlyContinue
-          }
-          
-          Write-Host "✅ Session ended"
-        shell: pwsh
+          if [ -n "${{ needs.deploy-64gb-vm.outputs.vm-name }}" ]; then
+            echo "🧹 Cleaning up VM: ${{ needs.deploy-64gb-vm.outputs.vm-name }}"
+            az vm delete \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+              --name ${{ needs.deploy-64gb-vm.outputs.vm-name }} \
+              --yes \
+              --no-wait
+            
+            echo "✅ Cleanup initiated. VM will be deleted shortly."
+          else
+            echo "⚠️ No VM to cleanup"
+          fi
